@@ -1,0 +1,11 @@
+services:
+  configuration_copilot:
+    image: johncapobianco/configuration_copilot:configuration_copilot
+    container_name: configuration_copilot
+    restart: always
+    build: 
+      context: ./
+      dockerfile: ./docker/Dockerfile.configuration
+    ports:
+      - "8502:8502"  # 👈 use `expose` instead of `ports` to keep it internal
+      - "8000:8000"
