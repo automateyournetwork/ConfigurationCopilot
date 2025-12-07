@@ -1,329 +1,241 @@
-# mcp_server.py — Config Copilot (Text RAG over Network Configs)
-import os, base64, uuid, tempfile, shutil, re, json
+# mcp_server.py — Config Copilot (Gemini Native RAG)
+import os
+import base64
+import uuid
+import tempfile
+import shutil
+import logging
+import re
+import time
+from typing import Dict, Any, List
 from collections import defaultdict
-from typing import Any, List, Tuple, Dict
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from google import genai
+from google.genai import types
 
-# LangChain / RAG
-from langchain.schema import Document
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationalRetrievalChain
-from langchain.prompts.chat import (
-    ChatPromptTemplate,
-    SystemMessagePromptTemplate,
-    HumanMessagePromptTemplate,
-    MessagesPlaceholder,
-)
-
-# -------------------------- ENV & Globals --------------------------
+# -------------------------- ENV & SETUP --------------------------
 load_dotenv()
-assert os.getenv("GOOGLE_API_KEY"), "GOOGLE_API_KEY is required for Gemini."
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-mcp = FastMCP("ConfigCopilot")
+if not GOOGLE_API_KEY:
+    raise ValueError("GOOGLE_API_KEY is required.")
 
-SESSIONS: Dict[str, dict] = defaultdict(dict)  # per-session state
-MAX_FILES = 2
+# Initialize FastMCP
+mcp = FastMCP("ConfigCopilot_Gemini")
+
+# Initialize Gemini Client
+client = genai.Client(api_key=GOOGLE_API_KEY)
+
+# SESSION STATE
+# Maps session_id -> { "store_id": str, "file_names": list }
+SESSIONS: Dict[str, dict] = defaultdict(dict)
+
+# CONSTANTS
+GEMINI_MODEL = "gemini-3-pro-preview"
 ALLOWED_EXT = {".txt", ".cfg", ".conf", ".ios", ".nxos", ".junos", ".log", ".md"}
 
-NETCONFIG_WHISPERER = """You are a senior network engineer specializing in reading and reasoning over network
-device configurations (Cisco IOS/IOS-XE/NX-OS, Junos, Arista EOS, etc.). Use only the provided {context}.
-Be precise; cite interface names, VRFs, routing protocols, route-targets, ACL names/rules, BGP neighbors/ASNs,
-static routes, NAT, QoS, AAA, SNMP, NTP, logging, line vty, crypto, and security hardening.
+# Phase 1 Goal: "Config Whisperer"
+NETCONFIG_WHISPERER = """
+You are a senior network engineer and "Config Whisperer" specializing in reading and reasoning over network device configurations.
 
 Guidelines:
-- If asked “where is X configured”, quote the exact stanza (trimmed) and explain impact.
-- If asked for validation, list risks/misconfigs (e.g., missing ‘login local’, weak SNMP, open vty, mismatched BGP timers).
-- If asked for deltas across multiple files, summarize differences (neighbors, VRFs, ACLs, versions, features).
-- Prefer concise Markdown; use fenced code blocks for config snippets.
-- Never invent commands not present in the loaded configs; if unknown, say so.
+1.  **Semantics & Intent:** Explain *what* the configuration achieves, not just the commands.
+2.  **Precision:** Cite specific interface names, VRFs, BGP ASNs, and IP addresses.
+3.  **Validation:** actively look for risks (open SNMP, weak SSH) and mismatches.
+4.  **Format:** Use clear Markdown. Use Code Blocks for config snippets.
+5.  **Tool Use:** You have access to a File Search tool containing the user's uploaded configs. Use it to answer questions.
 """
 
-# -------------------------- Helpers --------------------------
-def _session(sid: str) -> dict:
-    s = SESSIONS[sid]
-    if "dir" not in s:
-        s["dir"] = tempfile.mkdtemp(prefix=f"cfg_{sid[:8]}_")
-        s["files"] = []            # [(path, name)]
-        s["docs"] = []             # normalized Document[]
-        s["persist_dir"] = os.path.join(s["dir"], "chroma")
-        s["qa"] = None
-        s["memory"] = None
-    return s
+# -------------------------- HELPERS --------------------------
+
+def _get_session(session_id: str) -> dict:
+    if session_id not in SESSIONS:
+        SESSIONS[session_id] = {
+            "store_id": None, 
+            "file_names": [],
+            "temp_dir": tempfile.mkdtemp() # Keep a temp dir for transient file ops
+        }
+    return SESSIONS[session_id]
 
 def _safe_ext(name: str) -> bool:
     return os.path.splitext(name)[1].lower() in ALLOWED_EXT
 
-def _decode_bytes(b: bytes) -> str:
-    for enc in ("utf-8", "latin-1", "utf-16", "utf-8-sig"):
-        try: return b.decode(enc, errors="ignore")
-        except Exception: pass
-    return b.decode("utf-8", errors="ignore")
-
-def _normalize_config_text(text: str) -> str:
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = text.replace("\x00", "")
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-def _make_documents(file_tuples: List[Tuple[str, str]]) -> List[Document]:
-    docs = []
-    for fname, text in file_tuples:
-        docs.append(Document(page_content=text, metadata={"source": fname}))
-    return docs
-
-def _config_aware_split(docs: List[Document]) -> List[Document]:
+def _summarize_features_regex(text: str) -> Dict[str, int]:
     """
-    Config-aware chunking:
-      - Prefer to split on Cisco '!' dividers, blank lines, then per-line fallback.
-      - Chunk ~900 chars with ~90 overlap to keep stanzas intact.
+    Phase 0 Capability: Non-LLM Regex correlation.
+    Useful for quick inventory without burning tokens.
     """
-    splitter = RecursiveCharacterTextSplitter(
-        separators=[
-            "\n!\n!\n!\n!\n",
-            "\n!\n!\n",
-            "\n!\n",
-            "\n\n",
-            "\n",
-            " "
-        ],
-        chunk_size=900,
-        chunk_overlap=90,
-        length_function=len,
-        is_separator_regex=False
-    )
-    out: List[Document] = []
-    for d in docs:
-        for i, c in enumerate(splitter.split_text(d.page_content)):
-            out.append(Document(page_content=c, metadata={**d.metadata, "chunk": i}))
-    return out
-
-def _build_chain(docs: List[Document], persist_dir: str):
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2", model_kwargs={"device": "cpu"})
-    vstore = Chroma.from_documents(docs, embeddings, persist_directory=persist_dir)
-
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro-preview-03-25", temperature=0.3)
-    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-
-    prompt = ChatPromptTemplate.from_messages([
-        SystemMessagePromptTemplate.from_template(NETCONFIG_WHISPERER + "\n\n{context}"),
-        MessagesPlaceholder(variable_name="chat_history"),
-        HumanMessagePromptTemplate.from_template("{question}")
-    ])
-
-    def passthrough(history):  # keep full message objects
-        return history
-
-    qa = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=vstore.as_retriever(search_kwargs={"k": 12}),
-        memory=memory,
-        combine_docs_chain_kwargs={"prompt": prompt},
-        get_chat_history=passthrough
-    )
-    return qa, memory
-
-def _summarize_features(text: str) -> Dict[str, Any]:
-    """Cheap heuristic inventory (non-LLM) to help clients show quick facts."""
-    # Add/adjust patterns as you like
     patterns = {
         "bgp_neighbors": r"^\s*neighbor\s+[\w\.:/-]+",
-        "bgp_local_as": r"^\s*router\s+bgp\s+(\d+)",
         "vrf_defs": r"^\s*vrf\s+definition\s+(\S+)|^\s*ip\s+vrf\s+(\S+)",
         "ospf": r"^\s*router\s+ospf\s+\d+",
-        "eigrp": r"^\s*router\s+eigrp\s+\d+",
-        "isis": r"^\s*router\s+isis(\s+\S+)?",
         "static_routes": r"^\s*ip\s+route\s+",
-        "ntp": r"^\s*ntp\s+server\s+",
-        "snmp": r"^\s*snmp-server\s+",
-        "aaa": r"^\s*aaa\s+new-model|^\s*aaa\s+authentication",
-        "logging": r"^\s*logging\s+",
-        "line_vty": r"^\s*line\s+vty\s+",
-        "acl": r"^\s*(ip\s+access-list|access-list)\s+",
+        "acls": r"^\s*(ip\s+access-list|access-list)\s+",
         "interfaces": r"^\s*interface\s+\S+",
-        "crypto": r"^\s*crypto\s+",
-        "vxlan": r"vxlan|nve\s+interface",
-        "qos": r"^\s*(policy-map|class-map)\s+",
-        "nat": r"^\s*ip\s+nat\s+",
+        "crypto_maps": r"^\s*crypto\s+map\s+",
     }
     results = {}
     for k, pat in patterns.items():
-        try:
-            m = re.findall(pat, text, flags=re.MULTILINE | re.IGNORECASE)
-            results[k] = len(m)
-        except re.error:
-            results[k] = 0
+        results[k] = len(re.findall(pat, text, flags=re.MULTILINE | re.IGNORECASE))
     return results
 
-# -------------------------- MCP Tools --------------------------
+# -------------------------- MCP TOOLS --------------------------
+
 @mcp.tool
 def new_session() -> str:
-    """Create a new Config Copilot session and return its session_id."""
+    """Start a new clean session. Returns a session_id."""
     sid = str(uuid.uuid4())
-    _session(sid)
+    _get_session(sid)
     return sid
 
 @mcp.tool
-def upload_config_base64(session_id: str, filename: str, data_b64: str) -> dict:
+def upload_config_base64(session_id: str, filename: str, data_b64: str) -> str:
     """
-    Upload a text configuration file (base64). Supports up to 2 files per session.
-    Allowed extensions: .txt, .cfg, .conf, .ios, .nxos, .junos, .log, .md
-    Returns server-local path and file count.
+    Upload a network config file (Base64 encoded) to Gemini File Search.
+    Supported: .txt, .cfg, .conf, .ios, .nxos, .junos
     """
-    s = _session(session_id)
-    if len(s["files"]) >= MAX_FILES:
-        return {"error": f"File limit reached ({MAX_FILES})."}
-
+    session = _get_session(session_id)
+    
     if not _safe_ext(filename):
-        return {"error": f"Unsupported extension for {filename}. Allowed: {sorted(ALLOWED_EXT)}"}
+        return f"Error: Unsupported extension {filename}"
 
-    raw = base64.b64decode(data_b64)
-    text = _normalize_config_text(_decode_bytes(raw))
-    path = os.path.join(s["dir"], os.path.basename(filename))
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
-
-    s["files"].append((path, filename))
-    # Invalidate previous index if re-uploading
-    s["docs"] = []
-    s["qa"] = None
-    s["memory"] = None
-    if os.path.exists(s["persist_dir"]):
-        shutil.rmtree(s["persist_dir"], ignore_errors=True)
-
-    return {"path": path, "count": len(s["files"])}
-
-@mcp.tool
-def index_configs(session_id: str, chunk_size: int = 900, chunk_overlap: int = 90) -> dict:
-    """
-    Build embeddings and Chroma index from uploaded configs, with config-aware chunking.
-    Returns basic index stats.
-    """
-    s = _session(session_id)
-    if not s["files"]:
-        return {"error": "No configs uploaded yet."}
-    if len(s["files"]) > MAX_FILES:
-        return {"error": f"Too many files. Limit is {MAX_FILES}."}
-
-    # Load to Documents
-    tuples: List[Tuple[str, str]] = []
-    for path, name in s["files"]:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            tuples.append((name, f.read()))
-    docs = _make_documents(tuples)
-
-    # Temporary override for chunk params (if caller wants to tweak)
-    def split_with_params(docs_in: List[Document]) -> List[Document]:
-        splitter = RecursiveCharacterTextSplitter(
-            separators=["\n!\n!\n!\n!\n", "\n!\n!\n", "\n!\n", "\n\n", "\n", " "],
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            is_separator_regex=False,
-        )
-        out: List[Document] = []
-        for d in docs_in:
-            for i, c in enumerate(splitter.split_text(d.page_content)):
-                out.append(Document(page_content=c, metadata={**d.metadata, "chunk": i}))
-        return out
-
-    # Use config-aware defaults unless user changed sizes
-    if chunk_size == 900 and chunk_overlap == 90:
-        chunked = _config_aware_split(docs)
-    else:
-        chunked = split_with_params(docs)
-
-    if not chunked:
-        return {"error": "Chunking produced no documents."}
-
-    qa, memory = _build_chain(chunked, s["persist_dir"])
-    s["docs"] = chunked
-    s["qa"] = qa
-    s["memory"] = memory
-
-    # Per-file counts
-    counts = {}
-    for d in chunked:
-        src = d.metadata.get("source", "unknown")
-        counts[src] = counts.get(src, 0) + 1
-
-    return {
-        "files": [name for _, name in s["files"]],
-        "total_chunks": len(chunked),
-        "chunks_per_file": counts,
-        "persist_dir": s["persist_dir"],
-    }
-
-@mcp.tool
-def ask(session_id: str, question: str) -> dict:
-    """
-    Ask a question against the indexed configs (RAG over Chroma + Gemini).
-    Returns answer + brief provenance (file names present in top retrieved docs).
-    """
-    s = _session(session_id)
-    if s.get("qa") is None:
-        return {"error": "No index found. Call index_configs first."}
-
-    # ConversationalRetrievalChain does not expose retrieved docs directly;
-    # we can run a light manual retrieve to show provenance.
-    try:
-        retriever = s["qa"].retriever  # type: ignore[attr-defined]
-    except Exception:
-        retriever = None
-
-    provenance = []
-    if retriever:
+    # 1. Initialize Store if not exists
+    if not session["store_id"]:
         try:
-            docs = retriever.get_relevant_documents(question)
-            for d in docs[:5]:
-                provenance.append({
-                    "source": d.metadata.get("source"),
-                    "chunk": d.metadata.get("chunk"),
-                    "preview": (d.page_content[:240] + "…") if len(d.page_content) > 240 else d.page_content
-                })
-        except Exception:
-            pass
+            store = client.file_search_stores.create(
+                config={"display_name": f"mcp_session_{session_id[:8]}"}
+            )
+            session["store_id"] = store.name
+            print(f"Created Store: {store.name}")
+        except Exception as e:
+            return f"Error creating store: {e}"
 
-    resp = s["qa"]({"question": question})
-    answer = resp.get("answer", "No answer generated.")
-    return {"answer": answer, "provenance": provenance}
+    # 2. Save to temp disk (SDK requires file path)
+    file_path = os.path.join(session["temp_dir"], filename)
+    try:
+        raw_data = base64.b64decode(data_b64)
+        with open(file_path, "wb") as f:
+            f.write(raw_data)
+            
+        # 3. Upload to Google
+        # We explicitly upload to the store to ensure association
+        client.file_search_stores.upload_to_file_search_store(
+            file_search_store_name=session["store_id"],
+            file=file_path,
+            config={"mime_type": "text/plain"} # Force text/plain for configs
+        )
+        
+        session["file_names"].append(filename)
+        
+        # Wait briefly for indexing (naive polling)
+        time.sleep(2) 
+        
+        return f"Successfully uploaded {filename} to Knowledge Base."
+
+    except Exception as e:
+        return f"Upload failed: {e}"
 
 @mcp.tool
-def summarize_inventory(session_id: str) -> dict:
+def query_configs(session_id: str, question: str) -> str:
     """
-    Quick non-LLM feature inventory (regex heuristics) across uploaded configs.
-    Helpful for UI summaries before chat begins.
+    Ask a question about the uploaded network configurations.
+    Uses Gemini 3 Pro Preview with File Search.
     """
-    s = _session(session_id)
-    if not s["files"]:
-        return {"error": "No configs uploaded."}
+    session = _get_session(session_id)
+    store_id = session.get("store_id")
 
-    out = {}
-    for path, name in s["files"]:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            stats = _summarize_features(f.read())
-        out[name] = stats
-    return out
+    if not store_id:
+        return "No configurations uploaded yet. Please upload files first."
+
+    # Define the tool connection
+    tool = types.Tool(
+        file_search=types.FileSearch(
+            file_search_store_names=[store_id]
+        )
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=question,
+            config=types.GenerateContentConfig(
+                tools=[tool],
+                system_instruction=NETCONFIG_WHISPERER,
+                temperature=0.2
+            )
+        )
+        
+        # Check for grounding (citations)
+        answer = response.text
+        if response.candidates[0].grounding_metadata.grounding_chunks:
+            answer += "\n\n(Verified against uploaded config files)"
+            
+        return answer
+
+    except Exception as e:
+        return f"Error processing query: {e}"
 
 @mcp.tool
-def list_sources(session_id: str) -> list:
-    """List uploaded files for this session."""
-    s = _session(session_id)
-    return [name for _, name in s["files"]]
+def get_inventory_summary(session_id: str) -> dict:
+    """
+    Phase 0: Returns a quick Regex count of features (BGP, ACLs, etc) 
+    for all uploaded files. DOES NOT use LLM (Fast & Cheap).
+    """
+    session = _get_session(session_id)
+    summary = {}
+    
+    # We read from the local temp dir we kept
+    for fname in session["file_names"]:
+        local_path = os.path.join(session["temp_dir"], fname)
+        if os.path.exists(local_path):
+            with open(local_path, "r", encoding="utf-8", errors="ignore") as f:
+                summary[fname] = _summarize_features_regex(f.read())
+                
+    return summary
 
 @mcp.tool
-def cleanup(session_id: str) -> str:
-    """Delete session artifacts and remove the session from memory."""
-    s = SESSIONS.pop(session_id, None)
-    if s and (wd := s.get("dir")) and os.path.exists(wd):
-        shutil.rmtree(wd, ignore_errors=True)
-    return "ok"
+def cleanup_session(session_id: str) -> str:
+    """Deletes the Google File Search Store and local temp files."""
+    session = SESSIONS.get(session_id)
+    if not session:
+        return "Session not found."
 
-# -------------------------- Entry --------------------------
+    # Delete Google Store
+    if session["store_id"]:
+        try:
+            client.file_search_stores.delete(name=session["store_id"])
+            msg = f"Deleted store {session['store_id']}"
+        except Exception as e:
+            msg = f"Error deleting store: {e}"
+    else:
+        msg = "No store to delete"
+
+    # Delete local temp
+    if os.path.exists(session["temp_dir"]):
+        shutil.rmtree(session["temp_dir"])
+
+    del SESSIONS[session_id]
+    return f"Session cleaned up. {msg}"
+
 if __name__ == "__main__":
-    # HTTP transport suitable for Claude Desktop / Gemini-CLI / Continue, etc.
-    mcp.run(transport="http", host="0.0.0.0", port=8000)
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--transport",
+        choices=["http", "stdio"],
+        default="http",
+        help="MCP transport: http (for VS Code / Gemini-CLI) or stdio (for Claude Desktop)",
+    )
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8000)
+    args = parser.parse_args()
+
+    if args.transport == "http":
+        # HTTP server for VS Code / Gemini-CLI
+        mcp.run(transport="http", host=args.host, port=args.port)
+    else:
+        # Stdio server for Claude Desktop
+        mcp.run()

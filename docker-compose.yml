@@ -7,5 +7,5 @@ services:
       context: ./
       dockerfile: ./docker/Dockerfile.configuration
     ports:
-      - "8502:8502"  # 👈 use `expose` instead of `ports` to keep it internal
+      - "8502:8502"
       - "8000:8000"
